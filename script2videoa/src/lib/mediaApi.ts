@@ -1,5 +1,25 @@
 import { MediaAsset, MediaSearchRequest } from '../types';
 
+let queue: (() => void)[] = [];
+let activeCount = 0;
+// Limit to 3 concurrent requests to avoid server/API rate limiting
+const MAX_CONCURRENT = 3;
+
+async function enqueue(): Promise<void> {
+  if (activeCount >= MAX_CONCURRENT) {
+    await new Promise<void>(resolve => queue.push(resolve));
+  }
+  activeCount++;
+}
+
+function dequeue(): void {
+  activeCount--;
+  if (queue.length > 0) {
+    const next = queue.shift();
+    if (next) next();
+  }
+}
+
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: 'POST',
@@ -16,8 +36,13 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
 }
 
 export async function searchLicensedMedia(request: MediaSearchRequest): Promise<MediaAsset[]> {
-  const payload = await postJson<{ items: MediaAsset[] }>('/api/media/search', request);
-  return Array.isArray(payload.items) ? payload.items : [];
+  await enqueue();
+  try {
+    const payload = await postJson<{ items: MediaAsset[] }>('/api/media/search', request);
+    return Array.isArray(payload.items) ? payload.items : [];
+  } finally {
+    dequeue();
+  }
 }
 
 export async function verifyMediaAsset(asset: MediaAsset): Promise<MediaAsset> {

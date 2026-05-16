@@ -16,8 +16,8 @@ import {
   Save,
   Film
 } from 'lucide-react';
-import { AppSettings, MediaAsset, MediaProvider, ScriptSegment, AspectRatio, SearchLanguage } from './types';
-import { getGlobalContext, analyzeSentence, splitScriptIntoSentences } from './lib/gemini';
+import { AppSettings, MediaAsset, MediaProvider, ScriptSegment, AspectRatio, SearchLanguage, SearchIntent } from './types';
+import { getGlobalContext, analyzeSentence, analyzeSentenceBatch, splitScriptIntoSentences, setCustomGeminiApiKey, getCustomGeminiApiKey } from './lib/gemini';
 import { downloadMediaBlob, searchLicensedMedia } from './lib/mediaApi';
 import { isAssetExportable, shouldAutoSelect } from './lib/licenseGate';
 import { buildIntentQueries, extractEntityNames, inferSearchIntent, normalizeMediaTypeForIntent, providerPriorityForIntent } from './lib/scriptIntent';
@@ -120,6 +120,8 @@ export default function App() {
   const [script, setScript] = useState(SAMPLE_SCRIPT);
   const [segments, setSegments] = useState<ScriptSegment[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [showApiKeyModal, setShowApiKeyModal] = useState(!getCustomGeminiApiKey());
+  const [apiKeyValue, setApiKeyValue] = useState(getCustomGeminiApiKey());
   const [progress, setProgress] = useState(0);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [galleryFilter, setGalleryFilter] = useState<GalleryFilter>('all');
@@ -143,35 +145,58 @@ export default function App() {
     try {
       const countNeeded = scene.media_type === 'image' ? 6 : 4;
       let options: MediaAsset[] = [];
-      const queries = scene.media_queries.length > 0 ? scene.media_queries : [scene.scene_summary];
+      let queries = scene.media_queries.length > 0 ? [...scene.media_queries] : [scene.scene_summary];
+      
       const providers = scene.provider_priority.length > 0
         ? scene.provider_priority
         : providerPriorityForIntent(scene.search_intent, scene.media_type);
 
-      for (const query of queries) {
+      let attempts = 0;
+      const MAX_ATTEMPTS = 3;
+
+      while (options.length < countNeeded && attempts < MAX_ATTEMPTS) {
         if (runId !== activeRunIdRef.current) return;
-        if (options.length >= countNeeded) break;
 
-        const results = await searchLicensedMedia({
-          query,
-          mediaType: scene.media_type,
-          aspectRatio: settings.aspectRatio,
-          providers,
-          perProvider: scene.media_type === 'image' ? 5 : 4,
-          apiKeys: {
-            pexels: settings.pexelsApiKey,
-            pixabay: settings.pixabayApiKey,
-          },
-        });
+        for (const query of queries) {
+          if (runId !== activeRunIdRef.current) return;
+          if (options.length >= countNeeded) break;
 
-        const fresh = results.filter(res => !seenUrlsRef.current.has(getAssetKey(res)));
-        const toAdd = (fresh.length > 0 ? fresh : results)
-          .filter(res => !options.find(o => getAssetKey(o) === getAssetKey(res)))
-          .slice(0, countNeeded - options.length);
-        options.push(...toAdd);
-        toAdd.forEach(opt => markAsSeen(getAssetKey(opt)));
+          try {
+            const results = await searchLicensedMedia({
+              query,
+              mediaType: scene.media_type,
+              aspectRatio: settings.aspectRatio,
+              providers,
+              perProvider: scene.media_type === 'image' ? 5 : 4,
+              apiKeys: {
+                pexels: settings.pexelsApiKey,
+                pixabay: settings.pixabayApiKey,
+              },
+            });
+
+            const fresh = results.filter(res => !seenUrlsRef.current.has(getAssetKey(res)));
+            const toAdd = (fresh.length > 0 ? fresh : results)
+              .filter(res => !options.find(o => getAssetKey(o) === getAssetKey(res)))
+              .slice(0, countNeeded - options.length);
+            options.push(...toAdd);
+            toAdd.forEach(opt => markAsSeen(getAssetKey(opt)));
+          } catch (e: any) {
+            console.error("Error searching media", e);
+            await new Promise(r => setTimeout(r, 1500)); // Backoff on error
+          }
+        }
+
+        if (options.length < countNeeded) {
+          attempts++;
+          if (attempts < MAX_ATTEMPTS) {
+            await new Promise(r => setTimeout(r, 2000));
+            queries = attempts === 1 ? scene.keywords.slice(0, 3) : [scene.scene_summary];
+            if (queries.length === 0) queries = ['stock footage'];
+          }
+        }
       }
 
+      if (runId !== activeRunIdRef.current) return;
       if (runId !== activeRunIdRef.current) return;
       const autoSelected = options.find(shouldAutoSelect);
 
@@ -216,78 +241,110 @@ export default function App() {
       
       console.log(`Total sentences found: ${sentenceList.length}`);
       
-      for (let i = 0; i < sentenceList.length; i++) {
-        const sentence = sentenceList[i].trim();
-        if (!sentence) continue;
-        
-        if (i > 0) await delay(4500); // Slightly more delay for stability
+            const BATCH_TARGET_LENGTH = 1000;
+      const batches: { id: number; text: string }[][] = [];
+      let currentBatchGroup: { id: number; text: string }[] = [];
+      let currentLength = 0;
 
+      sentenceList.forEach((text, index) => {
+        const sentenceLength = text.length;
+        if (currentLength + sentenceLength > BATCH_TARGET_LENGTH && currentBatchGroup.length > 0) {
+          batches.push(currentBatchGroup);
+          currentBatchGroup = [];
+          currentLength = 0;
+        }
+        currentBatchGroup.push({ id: index + 1, text: text.trim() });
+        currentLength += sentenceLength;
+      });
+      if (currentBatchGroup.length > 0) {
+        batches.push(currentBatchGroup);
+      }
+
+      console.log(`Split into ${batches.length} batches based on length (Target: ~${BATCH_TARGET_LENGTH} chars).`);
+
+      for (let i = 0; i < batches.length; i++) {
         if (runId !== activeRunIdRef.current) return;
+
+        const sentenceObjects = batches[i];
+
+        if (sentenceObjects.length === 0) continue;
         
-        showToast(`Đang phân tích câu ${i + 1}/${sentenceList.length}`, 'success');
+        if (i > 0) await delay(4500);
+
+        showToast(`Đang phân tích câu ${sentenceObjects[0].id} đến ${sentenceObjects[sentenceObjects.length - 1].id}/${sentenceList.length}`, "success");
         try {
-          const analysis = await analyzeSentence(sentence, i + 1, context, settings.language, settings.targetRegion);
+          const batchAnalysis = await analyzeSentenceBatch(sentenceObjects, context, settings.language, settings.targetRegion);
+          const rawBatches = Array.isArray(batchAnalysis) ? batchAnalysis : (batchAnalysis ? [batchAnalysis] : []);
 
-          const possibleScenes = Array.isArray(analysis) ? analysis : (analysis?.scenes || analysis?.scene || analysis?.visual_scenes || [analysis]);
-          const rawScenes = (Array.isArray(possibleScenes) ? possibleScenes : [possibleScenes]).filter(s => s && typeof s === 'object' && (s.media_queries || s.keywords || s.scene_summary));
-          if (analysis && rawScenes.length > 0) {
-            const sentenceId = Number(analysis.sentence_id) || i + 1;
-            const newScenes: ScriptSegment[] = rawScenes.map((scene: any, index: number) => {
-              const summary = toText(scene.scene_summary, sentence);
-              const keywords = toStringArray(scene.keywords, [summary]);
-              const aiEntities = toStringArray(scene.entity_names);
-              const heuristicEntities = extractEntityNames(`${sentence} ${summary} ${keywords.join(' ')}`);
-              const entityNames = [...new Set([...aiEntities, ...heuristicEntities])];
-              const searchIntent = toText(scene.search_intent, inferSearchIntent(`${sentence} ${summary}`, entityNames)) as ScriptSegment['search_intent'];
-              const normalizedIntent = ['stock', 'real_person', 'real_event', 'place', 'documentary', 'abstract'].includes(searchIntent)
-                ? searchIntent
-                : inferSearchIntent(`${sentence} ${summary}`, entityNames);
-              const mediaType = normalizeMediaTypeForIntent(scene.media_type === 'video' ? 'video' : 'image', normalizedIntent, `${sentence} ${summary}`);
-              const mediaQueries = buildIntentQueries(toStringArray(scene.media_queries, keywords), summary, entityNames, normalizedIntent);
-              const providerPriority = providerPriorityForIntent(normalizedIntent, mediaType);
+          for (const sObj of sentenceObjects) {
+            const analysis = rawBatches.find((a) => a.sentence_id === sObj.id) || 
+                             rawBatches.find((a) => a.sentence_text === sObj.text) || 
+                             rawBatches.shift();
 
-              return {
-                id: `vs_${sentenceId}_${index + 1}`,
-                sentence_id: sentenceId,
-                scene_count: rawScenes.length,
-                scene_text: toText(analysis.sentence_text, sentence),
-                vietnamese_translation: toText(analysis.vietnamese_translation),
-                scene_summary: summary,
-                visual_meaning: toText(scene.visual_meaning),
-                camera_style: toText(scene.camera_style),
-                emotion: toText(scene.emotion, 'Neutral'),
-                style: toText(scene.style, 'Cinematic'),
-                media_type: mediaType,
-                keywords,
-                media_queries: mediaQueries.length > 0 ? mediaQueries : [summary],
-                visual_description: toText(scene.visual_description, summary),
-                selection_required: true,
-                export_file: toText(analysis.export_file, `${sentenceId}.txt`),
-                search_intent: normalizedIntent,
-                entity_names: entityNames,
-                provider_priority: providerPriority,
-                options: [],
-                status: 'searching'
-              };
-            });
+            const possibleScenes = Array.isArray(analysis) ? analysis : (analysis?.scenes || analysis?.scene || analysis?.visual_scenes || [analysis]);
+            const rawScenes = (Array.isArray(possibleScenes) ? possibleScenes : [possibleScenes]).filter(s => s && typeof s === "object" && (s.media_queries || s.keywords || s.scene_summary));
+            if (analysis && rawScenes.length > 0) {
+              const sentenceId = Number(analysis?.sentence_id) || sObj.id;
+              const newScenes = rawScenes.map((scene, index) => {
+                const summary = toText(scene.scene_summary, sObj.text);
+                const keywords = toStringArray(scene.keywords, [summary]);
+                const aiEntities = toStringArray(scene.entity_names);
+                const heuristicEntities = extractEntityNames(`${sObj.text} ${summary} ${keywords.join(" ")}`);
+                const entityNames = [...new Set([...aiEntities, ...heuristicEntities])];
+                const searchIntent = toText(scene.search_intent, inferSearchIntent(`${sObj.text} ${summary}`, entityNames));
+                const normalizedIntent = ["stock", "real_person", "real_event", "place", "documentary", "abstract"].includes(searchIntent)
+                  ? searchIntent as SearchIntent
+                  : inferSearchIntent(`${sObj.text} ${summary}`, entityNames);
+                const mediaType = normalizeMediaTypeForIntent(scene.media_type === "video" ? "video" : "image", normalizedIntent, `${sObj.text} ${summary}`);
+                const mediaQueries = buildIntentQueries(toStringArray(scene.media_queries, keywords), summary, entityNames, normalizedIntent);
+                const providerPriority = providerPriorityForIntent(normalizedIntent, mediaType);
 
-            setSegments(prev => [...prev, ...newScenes]);
-            mediaJobs.push(...newScenes.map(scene => fetchMediaForScene(scene, runId)));
-          } else {
-            failedSentenceCount += 1;
-            console.error(`Failed to analyze sentence ${i + 1}: Gemini returned no scenes`);
-            setSegments(prev => [...prev, createAnalysisErrorSegment(sentence, i + 1, 'Gemini returned no scenes')]);
-            showToast(`Lỗi khi xử lý câu ${i + 1}, đang tiếp tục...`, 'error');
+                return {
+                  id: `vs_${sentenceId}_${index + 1}`,
+                  sentence_id: sentenceId,
+                  scene_count: rawScenes.length,
+                  scene_text: toText(analysis?.sentence_text, sObj.text),
+                  vietnamese_translation: toText(analysis?.vietnamese_translation),
+                  scene_summary: summary,
+                  visual_meaning: toText(scene.visual_meaning),
+                  camera_style: toText(scene.camera_style),
+                  emotion: toText(scene.emotion, "Neutral"),
+                  style: toText(scene.style, "Cinematic"),
+                  media_type: mediaType,
+                  keywords,
+                  media_queries: mediaQueries.length > 0 ? mediaQueries : [summary],
+                  visual_description: toText(scene.visual_description, summary),
+                  selection_required: true,
+                  export_file: toText(analysis?.export_file, `${sentenceId}.txt`),
+                  search_intent: normalizedIntent,
+                  entity_names: entityNames,
+                  provider_priority: providerPriority,
+                  options: [],
+                  status: "searching" as const
+                };
+              });
+
+              setSegments(prev => [...prev, ...newScenes]);
+              mediaJobs.push(...newScenes.map(scene => fetchMediaForScene(scene, runId)));
+            } else {
+              failedSentenceCount += 1;
+              console.error(`Failed to analyze sentence ${sObj.id}: Gemini returned no scenes`);
+              setSegments(prev => [...prev, createAnalysisErrorSegment(sObj.text, sObj.id, "Gemini returned no scenes")]);
+              showToast(`Lỗi khi xử lý câu ${sObj.id}, đang tiếp tục...`, "error");
+            }
           }
         } catch (error) {
           if (runId !== activeRunIdRef.current) return;
-          failedSentenceCount += 1;
-          console.error(`Failed to analyze sentence ${i + 1}`, error);
-          setSegments(prev => [...prev, createAnalysisErrorSegment(sentence, i + 1, error)]);
-          showToast(`Lỗi khi xử lý câu ${i + 1}, đang tiếp tục...`, 'error');
+          failedSentenceCount += sentenceObjects.length;
+          console.error(`Failed to analyze batch ${i + 1}`, error);
+          
+          sentenceObjects.forEach(sObj => {
+            setSegments(prev => [...prev, createAnalysisErrorSegment(sObj.text, sObj.id, error)]);
+            showToast(`Lỗi khi xử lý câu ${sObj.id}, đang tiếp tục...`, "error");
+          });
         } finally {
           if (runId === activeRunIdRef.current) {
-            setProgress(Math.round(((i + 1) / sentenceList.length) * 100));
+            setProgress(Math.round(((i + 1) / batches.length) * 100));
           }
         }
       }
@@ -315,6 +372,8 @@ export default function App() {
       }
     }
   };
+
+  const mainScrollRef = useRef<HTMLDivElement>(null);
 
   const handleSelectOption = (segmentId: string, assetId: string) => {
     const segment = segments.find(s => s.id === segmentId);
@@ -525,7 +584,7 @@ export default function App() {
                 <span className="text-[8px] font-black text-brand-light uppercase tracking-[0.3em]">Cinematic Engine</span>
               </div>
             </div>
-            <Settings2 size={20} className="text-zinc-600 cursor-pointer hover:rotate-90 transition-transform duration-500" />
+            <Settings2 onClick={() => setShowApiKeyModal(true)} size={20} className="text-zinc-600 cursor-pointer hover:rotate-90 text-brand hover:text-brand-light transition-transform duration-500" />
           </header>
 
           <div className="flex-1 overflow-y-auto p-6 space-y-8 minimal-scrollbar">
@@ -549,27 +608,9 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 gap-4">
-              <div className="space-y-3">
-                <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
-                  <Key size={12} /> Pexels API Key (Optional if set on server)
-                </label>
-                <input
-                  type="password" value={settings.pexelsApiKey} onChange={(e) => setSettings({ ...settings, pexelsApiKey: e.target.value })}
-                  placeholder="Paste your key here..."
-                  className="w-full px-5 py-3 bg-[var(--color-bg-input)] border border-white/5 rounded-xl text-sm focus:ring-2 focus:ring-brand/50 outline-none"
-                />
-              </div>
+              
 
-              <div className="space-y-3">
-                <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
-                  <Key size={12} /> Pixabay API Key (Optional if set on server)
-                </label>
-                <input
-                  type="password" value={settings.pixabayApiKey} onChange={(e) => setSettings({ ...settings, pixabayApiKey: e.target.value })}
-                  placeholder="Paste your key here..."
-                  className="w-full px-5 py-3 bg-[var(--color-bg-input)] border border-white/5 rounded-xl text-sm focus:ring-2 focus:ring-brand/50 outline-none"
-                />
-              </div>
+              
               
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-3">
@@ -640,7 +681,7 @@ export default function App() {
           </footer>
         </aside>
 
-        <main className="flex-1 bg-[var(--color-bg-main)] overflow-y-auto minimal-scrollbar flex flex-col">
+        <main ref={mainScrollRef} className="flex-1 bg-[var(--color-bg-main)] overflow-y-auto minimal-scrollbar flex flex-col">
           {segments.length > 0 && (
             <div className="sticky top-0 z-30 px-8 py-4 bg-[#14181c]/90 backdrop-blur-xl border-b border-white/5 flex items-center justify-between">
               <div className="flex items-center gap-3">
@@ -689,9 +730,80 @@ export default function App() {
               onToggleManualReview={handleToggleManualReview}
               filter={galleryFilter}
               isProcessing={isProcessing}
+              scrollParentRef={mainScrollRef}
             />
           </div>
-        </main>
+        
+      {showApiKeyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-[var(--color-bg-panel)] w-full max-w-md p-6 rounded-2xl border border-white/10 shadow-2xl flex flex-col gap-6">
+            <div>
+              <h2 className="text-lg font-black uppercase tracking-widest flex items-center gap-2">
+                <Settings2 size={18} className="text-brand"/> Settings & API Keys
+              </h2>
+              <p className="text-xs text-zinc-500 mt-2">Configure API keys for Gemini and media providers.</p>
+            </div>
+            
+            <div className="flex flex-col gap-4">
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                  <Key size={12} /> Gemini API Key <span className="text-[8px] text-zinc-600">(Required if not set on server)</span>
+                </label>
+                <input
+                  type="password"
+                  placeholder="AIzaSy..."
+                  value={apiKeyValue || ''}
+                  onChange={e => setApiKeyValue(e.target.value)}
+                  className="w-full px-4 py-3 bg-[var(--color-bg-input)] border border-white/5 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand/50 transition-all font-mono"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                  <Key size={12} /> Pexels API Key <span className="text-[8px] text-zinc-600">(Optional)</span>
+                </label>
+                <input
+                  type="password" 
+                  value={settings.pexelsApiKey} 
+                  onChange={(e) => setSettings({ ...settings, pexelsApiKey: e.target.value })}
+                  placeholder="Optional if set on server..."
+                  className="w-full px-4 py-3 bg-[var(--color-bg-input)] border border-white/5 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand/50 transition-all font-mono"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                  <Key size={12} /> Pixabay API Key <span className="text-[8px] text-zinc-600">(Optional)</span>
+                </label>
+                <input
+                  type="password" 
+                  value={settings.pixabayApiKey} 
+                  onChange={(e) => setSettings({ ...settings, pixabayApiKey: e.target.value })}
+                  placeholder="Optional if set on server..."
+                  className="w-full px-4 py-3 bg-[var(--color-bg-input)] border border-white/5 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand/50 transition-all font-mono"
+                />
+              </div>
+            </div>
+            
+            <div className="flex justify-end gap-3 mt-2">
+              {getCustomGeminiApiKey() && (
+                <button
+                  onClick={() => setShowApiKeyModal(false)}
+                  className="px-4 py-2 text-xs font-bold text-zinc-400 hover:text-white transition-colors uppercase tracking-widest hover:bg-white/5 rounded-lg border border-transparent"
+                >Cancel</button>
+              )}
+              <button
+                onClick={() => {
+                  setCustomGeminiApiKey(apiKeyValue);
+                  setShowApiKeyModal(false);
+                }}
+                className="px-6 py-2 bg-brand text-black text-xs font-black uppercase tracking-widest hover:bg-brand-light transition-colors rounded-lg"
+              >Save Settings</button>
+            </div>
+          </div>
+        </div>
+      )}
+</main>
       </div>
     </div>
   );

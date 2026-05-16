@@ -57,6 +57,7 @@ export interface MediaSearchRequest {
   };
 }
 
+export type SearchIntent = 'stock' | 'real_person' | 'real_event' | 'place' | 'documentary' | 'abstract';
 export interface ScriptSegment {
   id: string;
   sentence_id: number;
@@ -74,7 +75,7 @@ export interface ScriptSegment {
   visual_description: string;
   selection_required: boolean;
   export_file: string;
-  search_intent: 'stock' | 'real_person' | 'real_event' | 'place' | 'documentary' | 'abstract';
+  search_intent: SearchIntent;
   entity_names: string[];
   provider_priority: MediaProvider[];
   

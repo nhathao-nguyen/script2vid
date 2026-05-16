@@ -5,7 +5,6 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import * as dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
-import { fileURLToPath } from 'url';
 import { classifyLicense } from './src/lib/licenseGate';
 import { searchMediaAssets } from './src/lib/mediaProviders';
 import type { MediaAsset, MediaProvider, MediaSearchRequest, MediaType } from './src/types';
@@ -13,28 +12,10 @@ import type { MediaAsset, MediaProvider, MediaSearchRequest, MediaType } from '.
 dotenv.config({ path: path.join(process.cwd(), '.env.local') });
 dotenv.config();
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-let geminiClient = null;
-let geminiClientKey = null;
 
-function getGeminiClient() {
-  let apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    console.warn('GEMINI_API_KEY is missing, proceeding anyway. Keys may be injected differently.');
-  } else {
-    apiKey = apiKey.replace(/^["']|["']$/g, '').trim();
-  }
-
-  if (!geminiClient || geminiClientKey !== apiKey) {
-    geminiClient = new GoogleGenAI({ apiKey: apiKey || '' });
-    geminiClientKey = apiKey;
-  }
-
-  return geminiClient;
-}
-
-function getErrorMessage(error) {
+// Delete the manual getGeminiClient code from here since it's now in gemini.server.ts
+function getErrorMessage(error: any) {
   let message = error instanceof Error ? error.message : String(error || '');
   try {
     if (message.startsWith('{') && message.includes('"error"')) {
@@ -116,8 +97,6 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: '1mb' }));
-
-  
 
   app.post('/api/media/search', async (req, res) => {
     try {
@@ -285,10 +264,10 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = typeof __dirname !== 'undefined' ? __dirname : path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(path.join(distPath, 'index.html'), err => { if (err) console.error('Error sending file: ', err, path.join(distPath, 'index.html')); });
     });
   }
 

@@ -3,35 +3,11 @@ import { GoogleGenAI } from '@google/genai';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
 let geminiClient: GoogleGenAI | null = null;
-let customApiKey: string | null = null;
-
-export function setCustomGeminiApiKey(key: string) {
-  customApiKey = key;
-  try {
-    if (key) {
-      localStorage.setItem('GEMINI_USER_API_KEY', key);
-    } else {
-      localStorage.removeItem('GEMINI_USER_API_KEY');
-    }
-  } catch(e) {}
-  // Reset client so it uses the new key
-  geminiClient = null;
-}
-
-export function getCustomGeminiApiKey(): string {
-  if (customApiKey !== null) return customApiKey;
-  try {
-    return localStorage.getItem('GEMINI_USER_API_KEY') || '';
-  } catch(e) {
-    return '';
-  }
-}
-
 function getGeminiClient() {
   if (!geminiClient) {
-    let apiKey = getCustomGeminiApiKey() || 'empty-key';
+    let apiKey = process.env.GEMINI_API_KEY;
     if (apiKey) apiKey = apiKey.replace(/^["']|["']$/g, '').trim();
-    geminiClient = new GoogleGenAI({ apiKey: apiKey });
+    geminiClient = new GoogleGenAI({ apiKey: apiKey || '' });
   }
   return geminiClient;
 }
@@ -128,7 +104,7 @@ function parseGeminiJson<T>(text: string): T {
   }
 }
 
-export async function getGlobalContext(script: string, targetRegion?: string): Promise<string> {
+export async function processGlobalContext(script: string, targetRegion?: string): Promise<string> {
   const prompt = `
 Task: Analyze script for "Cinematic North Star".
 Output: mood, theme, style, environment (<100 words).
@@ -155,7 +131,7 @@ Script: ${script}
   }
 }
 
-export async function analyzeSentenceBatch(
+export async function processSentenceBatch(
   sentences: { id: number; text: string }[],
   context: string,
   languageMode: string,
@@ -263,7 +239,7 @@ Output Format Requirements:
   }
 }
 
-export async function analyzeSentence(
+export async function processSentence(
   sentence: string,
   sentenceId: number,
   context: string,
@@ -363,59 +339,4 @@ Output Format Requirements:
     console.error('Gemini Analyze Error:', error);
     throw error;
   }
-}
-
-
-
-
-
-
-// Local helper logic
-function splitByWordLength(unit: string, maxLength: number): string[] {
-  const chunks: string[] = [];
-  let current = '';
-  for (const word of unit.split(/\s+/).filter(Boolean)) {
-    const next = current ? `${current} ${word}` : word;
-    if (next.length > maxLength && current) {
-      chunks.push(current);
-      current = word;
-    } else {
-      current = next;
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks;
-}
-
-function splitLongUnit(unit: string, maxLength = 320): string[] {
-  if (unit.length <= maxLength) return [unit];
-  const parts = unit.split(/(?<=[,;:])\s+|\s+-\s+/).map(part => part.trim()).filter(Boolean);
-  if (parts.length <= 1) return splitByWordLength(unit, maxLength);
-
-  const chunks: string[] = [];
-  let current = '';
-  for (const part of parts) {
-    const next = current ? `${current} ${part}` : part;
-    if (next.length > maxLength && current) {
-      chunks.push(current);
-      current = part;
-    } else {
-      current = next;
-    }
-  }
-  if (current) chunks.push(...(current.length > maxLength ? splitByWordLength(current, maxLength) : [current]));
-  return chunks;
-}
-
-function splitScriptLocally(script: string): string[] {
-  return script
-    .replace(/\r\n/g, '\n')
-    .split(/(?<=[.!?\u2026])\s+|\n+/)
-    .map(unit => unit.trim())
-    .filter(unit => unit.length > 2)
-    .flatMap(unit => splitLongUnit(unit));
-}
-
-export async function splitScriptIntoSentences(script: string, context: string): Promise<string[]> {
-  return splitScriptLocally(script);
 }
